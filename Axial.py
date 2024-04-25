@@ -1,6 +1,6 @@
 # load packages
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '6,7'
+os.environ['CUDA_VISIBLE_DEVICES'] = '5,6,7'
 
 from turtle import Turtle
 import numpy as np
@@ -9,12 +9,38 @@ from datetime import datetime
 from tqdm import tqdm 
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay
 import torch
+torch.backends.cudnn.enabled = False
 from torch.utils import data
 import torch.nn as nn
 import torch.optim as optim
 import math
 from data_MTS import Dataset_MTS
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+from torch.utils.data import DataLoader
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def isContiguous(tensor):
+    """
+    判断tensor是否连续    
+    :param torch.Tensor tensor: 
+    :return: bool
+    """
+
+    z = 1
+    d = tensor.dim() - 1
+    size = tensor.size()
+    stride = tensor.stride()
+    print("stride={} size={}".format(stride, size))
+    while d >= 0:
+        if size[d] != 1:
+            if stride[d] == z:
+                print("dim {} stride is {}, next stride should be {} x {}".format(d, stride[d], z, size[d]))
+                z *= size[d]                
+            else:
+                print("dim {} is not contiguous. stride is {}, but expected {}".format(d, stride[d], z))
+                return False
+        d -= 1
+    return True
 
 def count_params(model):
     # 定义总参数量、可训练参数量及非可训练参数量变量
@@ -47,6 +73,7 @@ class Dataset(data.Dataset):
         self.length = x.shape[0] - T - self.dim + 1 # -input_len -output_len +1
 
         x = torch.from_numpy(x)
+        
         self.x = torch.unsqueeze(x, 1)
         self.y = torch.from_numpy(y)
 
@@ -57,10 +84,11 @@ class Dataset(data.Dataset):
     def __getitem__(self, i):
         # if i >= self.length-1:
         #     print('current i: ', i)
+        
         input = self.x[i:i+self.dim, :] # (t,c,x_t)
         input = input.permute(1, 0, 2)
         
-        return input, self.y[i] 
+        return input, self.y[i]
 
 
 
@@ -99,7 +127,7 @@ class GatedAxialAttention(nn.Module):
         self.relative = nn.Parameter(torch.randn(self.dim_head_v * 2, dim * 2 - 1), requires_grad=True)
         query_index = torch.arange(dim).unsqueeze(0)
         key_index = torch.arange(dim).unsqueeze(1)
-        import pdb; pdb.set_trace()
+        
         relative_index = key_index - query_index + dim - 1
         self.register_buffer('flatten_index', relative_index.view(-1))
 
@@ -107,7 +135,6 @@ class GatedAxialAttention(nn.Module):
         # self.print_para()
 
     def forward(self, x):
-        
         if self.flag:
             x = x.permute(0, 2, 1, 3) # N, H, C, W for width (dim) attention
         else:
@@ -124,6 +151,7 @@ class GatedAxialAttention(nn.Module):
         # Calculate position embedding
         all_embeddings = torch.index_select(self.relative, 1, self.flatten_index).view(self.dim_head_v * 2, self.dim, self.dim)
         q_embedding, k_embedding, v_embedding = torch.split(all_embeddings, [self.dim_head_qk, self.dim_head_qk, self.dim_head_v], dim=0)
+        
         qr = torch.einsum('bgci,cij->bgij', q, q_embedding)
         kr = torch.einsum('bgci,cij->bgij', k, k_embedding).transpose(2, 3)
         qk = torch.einsum('bgci, bgcj->bgij', q, k)
@@ -134,6 +162,7 @@ class GatedAxialAttention(nn.Module):
         kr = torch.mul(kr, self.f_kr)
 
         stacked_similarity = torch.cat([qk, qr, kr], dim=1)
+        
         stacked_similarity = self.bn_similarity(stacked_similarity).view(N * W, 3, self.heads, H, H).sum(dim=1)
         #stacked_similarity = self.bn_qr(qr) + self.bn_kr(kr) + self.bn_qk(qk)
         # (N, heads, H, H, W)
@@ -193,20 +222,21 @@ class AxialLOB(nn.Module):
 
         self.activation = nn.ReLU()
         # self.linear = nn.Linear(1600, 3)
-        self.linear = nn.Linear(H*W, 3)
+        self.linear = nn.Linear(1024, 7)#H*W
         self.pooling = nn.AvgPool2d(kernel_size=pool_kernel, stride=pool_stride)
 
     def forward(self, x):
         
         #up branch
         #first convolution before the attention
-        # import pdb; pdb.set_trace()
+        
         y = self.CNN_in(x)
         y = self.norm(y)
         y = self.activation(y)
 
         #attention mechanism through gated multi head axial layer
         y = self.axial_width_1(y)
+    
         y = self.axial_height_1(y)
 
         #lower branch
@@ -239,8 +269,8 @@ class AxialLOB(nn.Module):
         y = self.pooling(y)
         y = torch.flatten(y, 1)
         y = self.linear(y)
-        forecast_y = torch.softmax(y, dim=1)
-        return forecast_y
+        # forecast_y = torch.softmax(y, dim=1)
+        return y
 
 
 
@@ -282,17 +312,15 @@ def batch_gd(model, criterion, optimizer, epochs):
         for inputs, targets in train_loader:
             
             # move data to GPU
-            inputs, targets = inputs.to(device, dtype=torch.float), targets.to(device, dtype=torch.int64)
+            inputs, targets = inputs.to(device, dtype=torch.float), targets.to(device, dtype=torch.float)
             
             # zero the parameter gradients
             optimizer.zero_grad()
-
-            # Forward pass
-           
-            outputs = model(inputs)
-            import pdb; pdb.set_trace()
-            loss = criterion(outputs, targets)
             
+            # Forward pass
+            outputs = model(inputs)
+            
+            loss = criterion(outputs, targets)
             # Backward and optimize
             loss.backward()
             optimizer.step()
@@ -348,10 +376,11 @@ dec_test = np.hstack((dec_test1, dec_test2, dec_test3))
 
 W = 40                     #number of features dim
 dim = 40                     #number of LOB states t
-
+num_classes = 3
+batch_size = 64
 horizon = 2        #if h = 5 than k = 10, h = 2 then k=50
 T = 5 # *10, output length, average of 5 futuer points
-
+# lob dataset
 y_train = dec_train[-horizon, :].flatten() # 一行
 y_val = dec_val[-horizon, :].flatten()
 y_test = dec_test[-horizon, :].flatten()
@@ -365,11 +394,27 @@ dec_val = dec_val[:40, :].T
 dec_test = dec_test[:40, :].T
 
 
+dataset_val = Dataset(dec_val, y_val, num_classes, dim)
+dataset_test = Dataset(dec_test, y_test, num_classes, dim)
+dataset_train = Dataset(dec_train, y_train, num_classes, dim)
+
+train_loader = torch.utils.data.DataLoader(dataset=dataset_train, batch_size=batch_size, shuffle=True)
+val_loader = torch.utils.data.DataLoader(dataset=dataset_val, batch_size=batch_size, shuffle=False)
+test_loader = torch.utils.data.DataLoader(dataset=dataset_test, batch_size=batch_size, shuffle=False)
+
+# ETTh1.csv
+
+W = 7
+dim = 256
+T = 72
+
+
 root_path = '/public/home/gongzhichen/code/translob-master/Axial-LOB-High-Frequency-Trading-with-Axial-Attention-main/'
 data_path = 'datasets/ETTh1.csv'
 in_len = 720
 out_len = 720
 all_data = []
+all_loader = []
 for flag in ['train', 'val', 'test']:
     data_set = Dataset_MTS(
                 root_path=root_path,
@@ -380,32 +425,27 @@ for flag in ['train', 'val', 'test']:
             )
 
     print(flag, len(data_set))
+    data_loader = DataLoader(
+            data_set,
+            batch_size=batch_size,
+            shuffle=True,
+        )
+
     all_data.append(data_set)
+    all_loader.append(data_loader)
 dec_train = all_data[0].data_x
 dec_val = all_data[1].data_x
 dec_test = all_data[2].data_x
 
+y_train = dec_train[dim-1:] - 1
+y_val = dec_val[dim-1:] - 1
+y_test = dec_test[dim-1:] - 1 
 
-# save_dict = {'dec_train': dec_train, 'dec_val':dec_val, 'dec_test':dec_test,'y_train':y_train, 'y_val':y_val, 'y_test':y_test}
-# np.save('/data/gzc/translob-master/Axial-LOB-High-Frequency-Trading-with-Axial-Attention-main/published/Pre_LOB.npy', save_dict)
-# import pdb; pdb.set_trace()
-# data = np.load('/data/gzc/translob-master/Axial-LOB-High-Frequency-Trading-with-Axial-Attention-main/published/Pre_LOB.npy', allow_pickle=True).tolist()
-# train_x = data['dec_train']
 
-# import pdb; pdb.set_trace()
+train_loader = all_loader[0]
+val_loader = all_loader[1]
+test_loader = all_loader[2]
 
-#Hyperparameters
-
-batch_size = 64
-epochs = 50 
-c_final = 4              #channel output size of the second conv
-n_heads = 4
-c_in_axial = 32          #channel output size of the first conv
-c_out_axial = 32
-pool_kernel = (1, 4)
-pool_stride = (1, 4)
-
-num_classes = 3
 
 dataset_val = Dataset(dec_val, y_val, num_classes, dim)
 dataset_test = Dataset(dec_test, y_test, num_classes, dim)
@@ -415,9 +455,27 @@ train_loader = torch.utils.data.DataLoader(dataset=dataset_train, batch_size=bat
 val_loader = torch.utils.data.DataLoader(dataset=dataset_val, batch_size=batch_size, shuffle=False)
 test_loader = torch.utils.data.DataLoader(dataset=dataset_test, batch_size=batch_size, shuffle=False)
 
+# save_dict = {'dec_train': dec_train, 'dec_val':dec_val, 'dec_test':dec_test,'y_train':y_train, 'y_val':y_val, 'y_test':y_test}
+# np.save('/data/gzc/translob-master/Axial-LOB-High-Frequency-Trading-with-Axial-Attention-main/published/Pre_LOB.npy', save_dict)
+
+# data = np.load('/data/gzc/translob-master/Axial-LOB-High-Frequency-Trading-with-Axial-Attention-main/published/Pre_LOB.npy', allow_pickle=True).tolist()
+# train_x = data['dec_train']
+
+
+
+#Hyperparameters
+
+
+epochs = 50 
+c_final = 4              #channel output size of the second conv
+n_heads = 4
+c_in_axial = 32          #channel output size of the first conv
+c_out_axial = 32
+pool_kernel = (1, 4)
+pool_stride = (1, 4)
 
 model = AxialLOB(W, dim, c_in_axial, c_out_axial, c_final, n_heads, pool_kernel, pool_stride)
-debug = True
+debug = False
 if debug:
     from torchstat import stat
     import torchsummary as summary
@@ -427,7 +485,8 @@ if debug:
     summary.summary(model.to(device), input_size=(1,40,40), batch_size=1)
 model.to(device)
 
-criterion = nn.CrossEntropyLoss()
+# criterion = nn.CrossEntropyLoss()
+criterion = nn.MSELoss()
 
 optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0.00001)
@@ -438,7 +497,7 @@ print("horizon    ->     " + str(T*10))
 print("batch size   ->    " + str(batch_size))
 print("Optimizer   ->    " + str(optimizer))
 
-train = False
+train = True
 if train:
     train_losses, val_losses = batch_gd(model, criterion, optimizer, epochs)
 
